@@ -1,212 +1,144 @@
-# -*- coding: utf-8 -*-
-"""
-Sistema de Recomendação de Jogos Steam com Similaridade de Cosseno
-Versão Melhorada com Tratamento de Erros, Cache e Performance
-"""
+# 00 - INSTALANDO DEPENDÊNCIAS
 
-# ==================== INSTALAÇÃO DE DEPENDÊNCIAS ====================
-import os
-import sys
-import subprocess
-import hashlib
 from time import sleep
-from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
-from io import StringIO
+print('='*80)
 
+print('Instalando dependências...')
+sleep(2)
 
-def install_dependencies():
-    """Instala dependências com tratamento de erros"""
-    dependencies = [
-        "pandas", "scikit-learn", "nltk",
-        "requests", "joblib", "numpy", "matplotlib"
-    ]
+print('='*80)
 
-    print('=' * 80)
-    print('Verificando dependências...')
+import subprocess, sys
+subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "scikit-learn", "nltk", "requests", "joblib", "numpy", "matplotlib"])
 
-    for package in dependencies:
-        try:
-            __import__(package)
-            print(f"{package:20} ✓ Já instalado")
-        except ImportError:
-            print(f"{package:20} ✗ Instalando...", end=' ')
-            try:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", package],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                print("✓ Concluído!")
-            except subprocess.CalledProcessError:
-                print("✗ Falha na instalação")
+print('='*80)
 
-    print('=' * 80)
-    print('Verificação de dependências concluída!')
-    print('=' * 80)
+print('Dependências instaladas! Importando...')
 
+print('='*80)
 
-# Executa a instalação de dependências
-install_dependencies()
-
-# ==================== IMPORTAÇÕES ====================
 import pandas as pd
-import numpy as np
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import nltk
 from nltk.corpus import stopwords
+import nltk
+import requests
+from io import StringIO
 from joblib import dump, load
+import hashlib
+import numpy as np
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox
-import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
 
-# ==================== CONFIGURAÇÕES ====================
-# URLs dos datasets
-STEAM_DATA_URL = 'https://raw.githubusercontent.com/RCDS13/Steam-Game-Similarity-Calculation-Agorithm/main/steam.csv'
-STEAM_MODIFIED_URL = 'https://raw.githubusercontent.com/RCDS13/Steam-Game-Similarity-Calculation-Agorithm/main/steam_modified.csv'
+# PARTE 01 - EXCLUSÃO DE COLUNAS IRRELEVANTES DO DATASET ORIGINAL (SEM TEXTOS ÚTEIS)
 
-# Configurações de diretórios
-CACHE_DIR = Path("cache")
-OUTPUT_DIR = Path("output")
-CACHE_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Carregar o dataset diretamente do GitHub
+url = 'https://raw.githubusercontent.com/RCDS13/Steam-Game-Similarity-Calculation-Agorithm/refs/heads/main/steam.csv'
+urlmod = 'https://raw.githubusercontent.com/RCDS13/Steam-Game-Similarity-Calculation-Agorithm/refs/heads/main/steam_modified.csv'
 
-# Configurações do pandas
+df = pd.read_csv(url)
+
+# Lista das colunas a eliminar
+colunas_para_eliminar = [
+    'release_date', 'english', 'platforms', 'required_age',
+    'achievements', 'positive_ratings', 'negative_ratings', 'average_playtime',
+    'median_playtime', 'owners', 'price'
+]
+
+df["name"] = df["name"].str.replace(r'®|™', '', regex=True)
+
+# Eliminar as colunas indesejadas
+df = df.drop(columns=colunas_para_eliminar)
+
+# Exibir as primeiras linhas do Dataset modificado
+
+print("\nExemplo do começo do Dataset modificado:")
+print('='*80)
+print(df.head())
+print('='*80)
+
+# Configurações
 pd.set_option('display.max_columns', 10)
 pd.set_option('display.width', 1000)
+nltk.download('stopwords')
+CACHE_DIR = "tfidf_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Gerando hash para otimização do algoritmo
+def get_data_hash(df):
+    return hashlib.md5(df['combined_text'].values.tobytes()).hexdigest()
 
-# ==================== FUNÇÕES DE CARREGAMENTO DE DADOS ====================
-def download_with_retry(url: str, max_retries: int = 3) -> Optional[requests.Response]:
-    """Baixa conteúdo com retry automático"""
-    session = requests.Session()
-    retry = Retry(
-        total=max_retries,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        respect_retry_after_header=True
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
+# Carrega e prepara os dados com otimização de memória
+def load_and_preprocess_data():
+    cache_file = 'steam_modified_cached.csv'
 
-    headers = {
-        "User-Agent": "SteamGameRecommender/1.0",
-        "Accept": "text/csv"
-    }
-
-    try:
-        response = session.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        return response
-    except requests.exceptions.RequestException as e:
-        print(f"Erro ao baixar {url}: {str(e)}")
-        return None
-
-
-def load_and_preprocess_data() -> Optional[pd.DataFrame]:
-    """Carrega e prepara os dados com tratamento de erros e cache"""
-    cache_file = CACHE_DIR / "steam_data_cache.csv"
-
-    # Tenta carregar do cache local primeiro
-    if cache_file.exists():
-        print("Carregando dados do cache local...")
+    # Se já existe local, usa ele
+    if os.path.exists(cache_file):
+        print("Carregando dataset do cache local...")
+        usecols = ['appid', 'name', 'categories', 'genres', 'steamspy_tags', 'developer', 'publisher']
+        df = pd.read_csv(cache_file, usecols=usecols, low_memory=False)
+    else:
         try:
-            return pd.read_csv(cache_file)
+            print("Baixando dataset do GitHub...")
+            response = requests.get(urlmod, timeout=10)
+            response.raise_for_status()
+
+            usecols = ['appid', 'name', 'categories', 'genres', 'steamspy_tags', 'developer', 'publisher']
+            df = pd.read_csv(StringIO(response.text), usecols=usecols, low_memory=False)
+            df.to_csv(cache_file, index=False)
+            print("Download concluído. Dataset salvo em cache.")
         except Exception as e:
-            print(f"Erro ao ler cache: {str(e)}")
+            print(f"Erro ao carregar dados: {e}")
+            return None
 
-    # Baixa e processa os dados
-    print("Baixando dados do GitHub...")
-    response = download_with_retry(STEAM_DATA_URL)
-    if response is None:
-        return None
+    # Criação do campo de texto combinado
+    df['combined_text'] = (
+        df['categories'].fillna('') + ' ' +
+        df['genres'].fillna('') + ' ' +
+        df['steamspy_tags'].fillna('') + ' ' +
+        df['name'].fillna('') + ' ' +
+        df['publisher'].fillna('') + ' ' +
+        df['developer'].fillna('')
+    ).str.replace(r'\s+', ' ', regex=True)
 
-    try:
-        # Carrega e processa os dados
-        df = pd.read_csv(StringIO(response.text))
+    return df
 
-        # Remove colunas não necessárias
-        cols_to_drop = [
-            'release_date', 'english', 'platforms', 'required_age',
-            'achievements', 'positive_ratings', 'negative_ratings',
-            'average_playtime', 'median_playtime', 'owners', 'price'
-        ]
-        df["name"] = df["name"].str.replace(r'®|™', '', regex=True)
-        df = df.drop(columns=[col for col in cols_to_drop if col in df.columns])
-
-        # Salva em cache (formato CSV)
-        df.to_csv(cache_file, index=False)
-        print("Dados salvos em cache local.")
-
-        return df
-
-    except Exception as e:
-        print(f"Erro ao processar dados: {str(e)}")
-        return None
-
-
-# ==================== PROCESSAMENTO TF-IDF ====================
-def create_tfidf_matrix(df: pd.DataFrame) -> Tuple[Any, Any, Any, pd.DataFrame]:
-    """Cria matriz TF-IDF com cache robusto"""
+# Cria matriz TF-IDF e salva dataset com features
+def create_tfidf_matrix(df):
     if df is None:
         return None, None, None, None
 
-    # Verifica e cria colunas necessárias
-    required_columns = ['categories', 'genres', 'steamspy_tags', 'name', 'publisher', 'developer']
-    for col in required_columns:
-        if col not in df.columns:
-            df[col] = ''  # Cria a coluna com valores vazios se não existir
-
-    # Cria a coluna combined_text
-    df['combined_text'] = (
-            df['categories'].fillna('') + ' ' +
-            df['genres'].fillna('') + ' ' +
-            df['steamspy_tags'].fillna('') + ' ' +
-            df['name'].fillna('') + ' ' +
-            df['publisher'].fillna('') + ' ' +
-            df['developer'].fillna('')
-    ).str.replace(r'\s+', ' ', regex=True)
-
-    # Gera hash único para os parâmetros atuais
-    params_hash = hashlib.md5((
-                                      str(df['combined_text'].values.tobytes()) +
-                                      "800" + "1,2"  # max_features + ngram_range
-                              ).encode()).hexdigest()
-
-    cache_file = CACHE_DIR / f"tfidf_cache_{params_hash}.joblib"
+    data_hash = get_data_hash(df)
+    cache_file = os.path.join(CACHE_DIR, f"{data_hash}.joblib")
+    output_file = os.path.join(OUTPUT_DIR, f"steam_with_features_{data_hash[:8]}.csv")
 
     # Tenta carregar do cache
-    if cache_file.exists():
-        try:
-            print("Carregando matriz TF-IDF do cache...")
-            cached = load(cache_file)
-            return cached['tfidf_matrix'], cached['vectorizer'], cached['cosine_sim'], df
-        except Exception as e:
-            print(f"Cache corrompido ({str(e)}). Recriando...")
+    if os.path.exists(cache_file):
+        print("Carregando dados do cache...")
+        cached = load(cache_file)
 
-    # Processamento dos dados
+        # Verifica se o CSV de output já existe
+        if not os.path.exists(output_file):
+            save_dataset_with_features(cached['vectorizer'], cached['tfidf_matrix'], df, output_file)
+
+        return cached['tfidf_matrix'], cached['vectorizer'], cached['cosine_sim'], df
+
     print("Processando dados (pode demorar alguns minutos)...")
 
-    # Configura stopwords
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('stopwords')
-
+    # PARTE 03 - APLICA A TÉCNICA DE STOP WORDS AO DATASET
     stop_words = set(stopwords.words('english'))
     custom_stopwords = {
         'game', 'play', 'player', 'players', 'multi', 'single',
-        'achievements', 'controller', 'partial', 'steam', 'support',
+        'achievements','controller', 'partial', 'steam', 'support',
         'early', 'access', 'windows', 'mac', 'linux'
     }
     stop_words.update(custom_stopwords)
 
-    # Configura o vetorizador TF-IDF
     vectorizer = TfidfVectorizer(
         stop_words=list(stop_words),
         max_features=800,
@@ -215,137 +147,222 @@ def create_tfidf_matrix(df: pd.DataFrame) -> Tuple[Any, Any, Any, pd.DataFrame]:
         dtype=np.float32
     )
 
-    # Pré-processamento do texto (agora corretamente indentado)
-    df['processed_text'] = (
-        df['combined_text']
-        .str.lower()
-        .str.replace('[;,.|]', ' ', regex=True)
-        .apply(lambda x: ' '.join(sorted(set(x.split()), key=x.split().index)))
-    )
+    # Pré-processamento
+    df['processed_text'] = df['combined_text'].str.lower().str.replace('[;,.|]', ' ', regex=True)
+    df['processed_text'] = df['processed_text'].apply(
+        lambda x: ' '.join(sorted(set(x.split()), key=x.split().index)))
 
-    # Cria a matriz TF-IDF
     tfidf_matrix = vectorizer.fit_transform(df['processed_text'])
+
+    # PARTE 04 - CÁLCULO DE SIMILARIDADE E APRESENTAÇÃO DOS RESULTADOS NO CONSOLE
+
+    # Pré-calcula a matriz de similaridade
+    print('''    Calculando similaridades... 
+    exibindo insights do TF-IDF... 
+    aguarde a interface inicializar...''')
+    print('=' * 80)
     cosine_sim = cosine_similarity(tfidf_matrix)
 
+    # PARTE 05 - INSIGHTS DO TF-IDF
+
+    # Verifica a qualidade do processamento textual
+    def debug_similarity():
+        print("\n=== DIAGNÓSTICO DO MODELO ===")
+
+        # Amostra de textos processados
+        print("\nAmostra de textos processados:")
+        sample = df.sample(3)
+        for idx, row in sample.iterrows():
+            print(f"\nJogo: {row['name']}")
+            print(f"Texto original: {row['combined_text']}")
+            print(f"Processado: {row['processed_text']}")
+
+        # Verifica termos mais importantes
+        print("\nTop 10 termos no TF-IDF:")
+        feature_names = vectorizer.get_feature_names_out()
+        print(feature_names[:10])
+
+        # Testa similaridade entre jogos conhecidos
+        test_pairs = [
+            ("Portal", "Portal 2"),
+            ("Call of Duty 2", "Call of Duty"),
+            ("Left 4 Dead", "Left 4 Dead 2"),
+        ]
+
+        for game1, game2 in test_pairs:
+            try:
+                idx1 = df[df['name'].str.contains(game1, case=False)].index[0]
+                idx2 = df[df['name'].str.contains(game2, case=False)].index[0]
+                sim = cosine_sim[idx1, idx2]
+                print(f"\nSimilaridade '{df.loc[idx1, 'name']}' vs '{df.loc[idx2, 'name']}': {sim:.2f}")
+
+                # Mostra termos em comum
+                terms1 = set(row['processed_text'].split())
+                terms2 = set(df.loc[idx2, 'processed_text'].split())
+                common = terms1 & terms2
+                print(f"Termos em comum: {common if common else 'Nenhum'}")
+
+            except Exception as e:
+                print(f"\nErro ao comparar {game1} e {game2}: {str(e)}")
+
+    # Executa os insights
+    debug_similarity()
+
     # Salva no cache
-    try:
-        dump({
-            'tfidf_matrix': tfidf_matrix,
-            'vectorizer': vectorizer,
-            'cosine_sim': cosine_sim
-        }, cache_file)
-        print(f"Matriz TF-IDF salva em cache: {cache_file}")
-    except Exception as e:
-        print(f"Erro ao salvar cache: {str(e)}")
+    dump({
+        'tfidf_matrix': tfidf_matrix,
+        'vectorizer': vectorizer,
+        'cosine_sim': cosine_sim
+    }, cache_file)
+
+    # Salva dataset com features
+    save_dataset_with_features(vectorizer, tfidf_matrix, df, output_file)
 
     return tfidf_matrix, vectorizer, cosine_sim, df
 
 
-# ==================== FUNÇÕES DE RECOMENDAÇÃO ====================
-def find_similar_games(game_name: str, cosine_sim: np.ndarray, df: pd.DataFrame, top_n: int = 10) -> Optional[
-    pd.DataFrame]:
-    """Busca jogos similares com tratamento robusto"""
+def save_dataset_with_features(vectorizer, tfidf_matrix, df, output_file):
+    """Salva o dataset original com as features TF-IDF como colunas"""
+
+
+    # Converte a matriz esparsa para Dataset
+    features_df = pd.DataFrame.sparse.from_spmatrix(
+        tfidf_matrix,
+        columns=[f"tfidf_{f}" for f in vectorizer.get_feature_names_out()])
+
+    # Combina com os dados originais
+    result_df = pd.concat([df.reset_index(drop=True), features_df], axis=1)
+
+    # Salvamento usado apenas para visualização do Dataset. (está no .rar do repositório)
+    #result_df.to_csv(output_file, index=False)
+    #print(f"Dataset com features salvo em: {output_file}")
+
+
+# Busca por jogos similares com seleção numérica
+def find_similar_games(game_name, cosine_sim, df, top_n=10):
     if cosine_sim is None or df is None:
         return None
 
-    try:
-        # Busca case insensitive e tolerante a erros
-        matches = df[df['name'].str.lower().str.contains(game_name.lower(), na=False)]
+    # Alternativas para 'jogo não encontrado'
+    matches = df[df['name'].str.lower().str.contains(game_name.lower())]
 
-        if len(matches) == 0:
-            print(f"\nJogo '{game_name}' não encontrado.")
-            print("Sugestão: Verifique a ortografia ou veja alguns jogos populares:")
-            print(df.sample(5)[['name']].to_string(index=False, header=False))
-            return None
-
-        # Seleção do jogo
-        if len(matches) > 1:
-            print("\nVários jogos encontrados. Escolha um:")
-            for idx, row in matches.reset_index(drop=True).iterrows():
-                print(f"{idx + 1}: {row['name']}")
-
-            try:
-                choice = int(input("\nDigite o número do jogo desejado: ")) - 1
-                selected_index = matches.index[choice if 0 <= choice < len(matches) else 0]
-            except:
-                print("Entrada inválida. Usando o primeiro jogo da lista.")
-                selected_index = matches.index[0]
-        else:
-            selected_index = matches.index[0]
-
-        # Obtém recomendações
-        game_name = df.loc[selected_index, 'name']
-        print(f"\nBuscando jogos similares a: {game_name}")
-
-        sim_scores = list(enumerate(cosine_sim[selected_index]))
-        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:top_n + 1]
-
-        # Formata resultados
-        result = df.iloc[[i[0] for i in sim_scores]][['name', 'genres']].copy()
-        result['similarity'] = [round(score, 3) for _, score in sim_scores]
-        result['genres'] = result['genres'].str.replace(';', ', ')
-
-        return result.reset_index(drop=True)
-
-    except Exception as e:
-        print(f"Erro ao buscar jogos similares: {str(e)}")
+    if len(matches) == 0:
+        print(f"\nJogo '{game_name}' não encontrado.")
+        print("Sugestão: Verifique a ortografia ou veja alguns jogos populares:")
+        print(df.sample(5)[['name']].to_string(index=False, header=False))
         return None
 
+    if len(matches) > 1:
+        print("\nVários jogos encontrados. Escolha um:")
+        matches = matches.reset_index(drop=True)
+        for idx, row in matches.iterrows():
+            print(f"{idx + 1}: {row['name']}")
 
-# ==================== INTERFACE GRÁFICA ====================
+        try:
+            choice = int(input("\nDigite o número do jogo desejado: ")) - 1
+            if 0 <= choice < len(matches):
+                selected_index = matches.index[choice]
+            else:
+                print("Número inválido. Usando o primeiro jogo da lista.")
+                selected_index = matches.index[0]
+        except:
+            print("Entrada inválida. Usando o primeiro jogo da lista.")
+            selected_index = matches.index[0]
+    else:
+        selected_index = matches.index[0]
+
+    game_name = df.loc[selected_index, 'name']
+    print(f"\nBuscando jogos similares a: {game_name}")
+
+    # Usa a matriz de similaridade pré-calculada
+    sim_scores = list(enumerate(cosine_sim[selected_index]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:top_n + 1]
+    game_indices = [i[0] for i in sim_scores]
+
+    # Formata resultados
+    result = df.iloc[game_indices][['name', 'genres']].copy()
+    result['similarity'] = [round(score, 3) for _, score in sim_scores]
+    result['genres'] = result['genres'].str.replace(';', ', ')
+
+    return result.reset_index(drop=True)
+
+
+def main():
+    print("Carregando dados Steam...")
+    df = load_and_preprocess_data()
+
+    if df is None:
+        return
+
+    # Carrega matriz TF-IDF e similaridades
+    tfidf_matrix, vectorizer, cosine_sim, df = create_tfidf_matrix(df)
+
+    print("\nSistema de Recomendação de Jogos Steam")
+    print("-"*35)
+
+    while True:
+        print("\nJogos disponíveis (amostra aleatória):")
+        print(df.sample(5)[['name']].to_string(index=False, header=False))
+
+        game_name = input("\nDigite parte do nome do jogo (ou 'sair' para terminar): ").strip()
+
+        if game_name.lower() == 'sair':
+            break
+
+        similar_games = find_similar_games(game_name, cosine_sim, df)
+
+        if similar_games is not None:
+            print(f"\nTop 10 jogos similares:")
+            print(similar_games.to_string(index=False))
+
+# PARTE 05 - CRIAÇÃO DA INTERFACE
 class SteamRecommenderGUI:
-    def __init__(self, root: tk.Tk, df: pd.DataFrame, cosine_sim: np.ndarray):
+    def __init__(self, root, df, cosine_sim):
         self.root = root
         self.df = df
         self.cosine_sim = cosine_sim
-        self.selected_game_index: Optional[int] = None
+        self.selected_game_index = None
 
-        try:
-            self.setup_ui()
-            self.setup_styles()
-            self.update_random_games()
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha ao inicializar interface: {str(e)}")
-            self.root.destroy()
-            raise
+        self.setup_ui()
+        self.setup_styles()
 
-    def setup_ui(self) -> None:
-        """Configura a interface gráfica"""
-        self.root.title("Recomendação de Jogos Steam")
+    def setup_ui(self):
+        self.root.title("Recomendação de jogos da Steam")
         self.root.geometry("1100x700")
 
-        # Container principal
+        # Main container
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Área de busca
+        # Search frame
         search_frame = ttk.Frame(main_frame)
         search_frame.pack(fill=tk.X, pady=5)
 
-        ttk.Label(search_frame, text="Buscar jogo:").pack(side=tk.LEFT)
+        ttk.Label(search_frame, text="Busque o jogo:").pack(side=tk.LEFT)
+
         self.search_entry = ttk.Entry(search_frame, width=40)
         self.search_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Button(search_frame, text="Buscar", command=self.search_games).pack(side=tk.LEFT)
 
-        # Exibição de jogos aleatórios
-        random_frame = ttk.LabelFrame(main_frame, text="Jogos Aleatórios")
+        search_btn = ttk.Button(search_frame, text="Busca", command=self.search_games)
+        search_btn.pack(side=tk.LEFT)
+
+        # Random games display
+        random_frame = ttk.LabelFrame(main_frame, text="Exemplo de jogos (aleatório)")
         random_frame.pack(fill=tk.X, pady=5)
+
         self.random_games_label = ttk.Label(random_frame, text="", wraplength=800)
         self.random_games_label.pack()
+        self.update_random_games()
 
-        # Área de resultados
+        # Results display
         results_frame = ttk.Frame(main_frame)
         results_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Treeview para resultados
-        self.results_tree = ttk.Treeview(
-            results_frame,
-            columns=('name', 'genres', 'similarity'),
-            show='headings'
-        )
-        self.results_tree.heading('name', text='Nome do Jogo')
-        self.results_tree.heading('genres', text='Gêneros')
-        self.results_tree.heading('similarity', text='Similaridade')
+        # Treeview for results
+        self.results_tree = ttk.Treeview(results_frame, columns=('name', 'genres', 'similarity'), show='headings')
+        self.results_tree.heading('name', text='Game Name')
+        self.results_tree.heading('genres', text='Genres')
+        self.results_tree.heading('similarity', text='Similarity')
 
         self.results_tree.column('name', width=300)
         self.results_tree.column('genres', width=400)
@@ -353,124 +370,122 @@ class SteamRecommenderGUI:
 
         scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.results_tree.yview)
         self.results_tree.configure(yscroll=scrollbar.set)
+
         self.results_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Área do gráfico
-        graph_frame = ttk.LabelFrame(main_frame, text="Gráfico de Similaridade")
+        # Graph frame
+        graph_frame = ttk.LabelFrame(main_frame, text="Gráfico de similaridade")
         graph_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
         self.fig, self.ax = plt.subplots(figsize=(8, 4))
         self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Eventos
+        # Bind selection event
         self.results_tree.bind('<<TreeviewSelect>>', self.on_game_select)
-        self.search_entry.bind('<Return>', lambda event: self.search_games())
 
-    def setup_styles(self) -> None:
-        """Configura os estilos visuais"""
+    def setup_styles(self):
         style = ttk.Style()
-        style.configure('TFrame', background='#f0f0f0')
-        style.configure('TLabel', background='#f0f0f0', font=('Arial', 10))
-        style.configure('TButton', font=('Arial', 10))
-        style.configure('Treeview', rowheight=25, font=('Arial', 9))
-        style.configure('Treeview.Heading', font=('Arial', 10, 'bold'))
+        style.configure('Treeview', rowheight=25)
 
-    def update_random_games(self) -> None:
-        """Atualiza a exibição de jogos aleatórios"""
-        sample = self.df.sample(5)['name'].tolist()
-        self.random_games_label.config(text=", ".join(sample))
+    def update_random_games(self):
+        sample_games = self.df.sample(5)['name'].tolist()
+        self.random_games_label.config(text=", ".join(sample_games))
 
-    def search_games(self) -> None:
-        """Realiza a busca por jogos"""
+    def search_games(self):
         query = self.search_entry.get().strip()
         if not query:
-            messagebox.showwarning("Aviso", "Por favor, digite o nome de um jogo")
+            messagebox.showwarning("Atenção", "Insira o nome de um jogo")
             return
 
-        # Limpa resultados anteriores
-        self.results_tree.delete(*self.results_tree.get_children())
+        # Clear previous results
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
 
-        try:
-            # Busca os jogos
-            matches = self.df[self.df['name'].str.lower().str.contains(query.lower(), na=False)]
+        # Find matching games
+        matches = self.df[self.df['name'].str.lower().str.contains(query.lower())]
 
-            if len(matches) == 0:
-                messagebox.showinfo("Não encontrado", f"Nenhum jogo encontrado para '{query}'")
-                return
+        if len(matches) == 0:
+            messagebox.showinfo("Not Found", f"No games found matching '{query}'")
+            return
 
-            if len(matches) > 1:
-                self.show_selection_dialog(matches)
-            else:
-                self.show_similar_games(matches.index[0])
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha na busca: {str(e)}")
+        if len(matches) > 1:
+            self.show_selection_dialog(matches)
+        else:
+            self.show_similar_games(matches.index[0])
 
-    def show_selection_dialog(self, matches: pd.DataFrame) -> None:
-        """Mostra diálogo de seleção para múltiplos resultados"""
+    def show_selection_dialog(self, matches):
         dialog = tk.Toplevel(self.root)
-        dialog.title("Selecione um Jogo")
+        dialog.title("Selecione o jogo")
         dialog.geometry("400x300")
 
-        ttk.Label(dialog, text="Múltiplos jogos encontrados. Selecione um:").pack(pady=10)
+        label = ttk.Label(dialog, text="Diversos jogos encontrados. Selecione um:")
+        label.pack(pady=10)
 
-        listbox = tk.Listbox(dialog, font=('Arial', 10))
+        listbox = tk.Listbox(dialog)
         for idx, row in matches.iterrows():
             listbox.insert(tk.END, row['name'])
         listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         def on_select():
-            if listbox.curselection():
-                selected_index = matches.index[listbox.curselection()[0]]
+            selection = listbox.curselection()
+            if selection:
+                selected_index = matches.index[selection[0]]
                 dialog.destroy()
                 self.show_similar_games(selected_index)
 
-        ttk.Button(dialog, text="Selecionar", command=on_select).pack(pady=10)
-        dialog.grab_set()
+        select_btn = ttk.Button(dialog, text="Select", command=on_select)
+        select_btn.pack(pady=10)
 
-    def show_similar_games(self, game_index: int) -> None:
-        """Mostra jogos similares ao selecionado"""
+        dialog.grab_set()
+        dialog.wait_window()
+
+    def show_similar_games(self, game_index):
         self.selected_game_index = game_index
         game_name = self.df.loc[game_index, 'name']
 
-        try:
-            # Obtém jogos similares
-            sim_scores = list(enumerate(self.cosine_sim[game_index]))
-            sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:11]
+        # Get similar games
+        sim_scores = list(enumerate(self.cosine_sim[game_index]))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:11]  # Top 10
 
-            # Limpa e preenche a treeview
-            self.results_tree.delete(*self.results_tree.get_children())
-            for idx, score in sim_scores:
-                game_data = self.df.iloc[idx]
-                self.results_tree.insert('', 'end',
-                                         values=(
-                                             game_data['name'],
+        # Clear previous results
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+
+        # Add results to treeview
+        for idx, score in sim_scores:  # Aqui score já é o valor de similaridade (não uma lista)
+            game_data = self.df.iloc[idx]
+            self.results_tree.insert('', 'end',
+                                     values=(game_data['name'],
                                              game_data['genres'].replace(';', ', '),
-                                             f"{score:.3f}"
-                                         )
-                                         )
+                                             f"{score:.3f}"))  # Usamos score diretamente
 
-            # Atualiza o gráfico
-            self.update_similarity_graph(game_index)
+        # Update graph
+        self.update_similarity_graph(game_index)
 
-            # Seleciona o primeiro item
-            if self.results_tree.get_children():
-                self.results_tree.selection_set(self.results_tree.get_children()[0])
+        # Select first item
+        if len(self.results_tree.get_children()) > 0:
+            self.results_tree.selection_set(self.results_tree.get_children()[0])
 
-        except Exception as e:
-            messagebox.showerror("Erro", f"Falha ao buscar similares: {str(e)}")
+    def update_similarity_graph(self, game_index):
+        plt.rcParams['font.sans-serif'] = [
+            'SimHei',  # Windows
+            'Microsoft YaHei',  # Windows alternativo
+            'WenQuanYi Zen Hei',  # Linux
+            'AppleGothic',  # Mac
+            'Noto Sans CJK JP'  # Fonte universal
+        ]
+        plt.rcParams['axes.unicode_minus'] = False  # Corrige exibição de sinais negativos
 
-    def update_similarity_graph(self, game_index: int) -> None:
-        """Atualiza o gráfico de similaridade"""
         self.ax.clear()
 
         game_name = self.df.loc[game_index, 'name']
         sim_scores = list(enumerate(self.cosine_sim[game_index]))
-        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:11]
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:11]  # Top 10
 
         games = [self.df.iloc[i[0]]['name'] for i in sim_scores]
-        scores = [i[1] for i in sim_scores]
+        scores = [i[1] for i in sim_scores]  # i[1] contém o valor de similaridade
 
         y_pos = np.arange(len(games))
         bars = self.ax.barh(y_pos, scores, color='skyblue')
@@ -478,8 +493,8 @@ class SteamRecommenderGUI:
         self.ax.set_yticks(y_pos)
         self.ax.set_yticklabels(games)
         self.ax.invert_yaxis()
-        self.ax.set_xlabel('Nível de Similaridade')
-        self.ax.set_title(f'Jogos similares a "{game_name}"')
+        self.ax.set_xlabel('Nível de similaridade')
+        self.ax.set_title(f'Jogos similares à "{game_name}"')
 
         for bar in bars:
             width = bar.get_width()
@@ -489,58 +504,25 @@ class SteamRecommenderGUI:
 
         self.canvas.draw()
 
-    def on_game_select(self, event: tk.Event) -> None:
-        """Trata a seleção de um jogo na lista"""
-        selected = self.results_tree.selection()
-        if selected:
-            # Implemente ações adicionais aqui se necessário
+    def on_game_select(self, event):
+        selected_item = self.results_tree.selection()
+        if selected_item:
             pass
 
+def main_gui():
+    print("Carregando dados Steam...")
+    df = load_and_preprocess_data()
 
-# ==================== FUNÇÃO PRINCIPAL ====================
-def main():
-    """Função principal do aplicativo"""
-    try:
-        print("\n" + "=" * 80)
-        print("Iniciando Sistema de Recomendação de Jogos Steam")
-        print("=" * 80 + "\n")
+    if df is None:
+        return
 
-        # Carrega e processa os dados
-        print("Carregando dados Steam...")
-        df = load_and_preprocess_data()
+    # Carrega a matrix IF-IDF e similaridades
+    tfidf_matrix, vectorizer, cosine_sim, df = create_tfidf_matrix(df)
 
-        if df is None:
-            messagebox.showerror("Erro", "Não foi possível carregar os dados")
-            return
-
-        # Processamento TF-IDF
-        print("Processando dados para recomendação...")
-        tfidf_matrix, vectorizer, cosine_sim, df = create_tfidf_matrix(df)
-
-        # Configuração da janela principal
-        root = tk.Tk()
-
-        # Centraliza a janela
-        window_width = 1100
-        window_height = 700
-        screen_width = root.winfo_screenwidth()
-        screen_height = root.winfo_screenheight()
-        center_x = int(screen_width / 2 - window_width / 2)
-        center_y = int(screen_height / 2 - window_height / 2)
-        root.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
-
-        # Inicia a interface
-        SteamRecommenderGUI(root, df, cosine_sim)
-        root.mainloop()
-
-    except Exception as e:
-        print(f"\nErro fatal: {str(e)}")
-        messagebox.showerror("Erro Fatal", f"O aplicativo encontrou um erro:\n{str(e)}")
-    finally:
-        print("\n" + "=" * 80)
-        print("Sistema encerrado")
-        print("=" * 80)
-
+    # Cria GUI
+    root = tk.Tk()
+    SteamRecommenderGUI(root, df, cosine_sim)
+    root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    main_gui()
